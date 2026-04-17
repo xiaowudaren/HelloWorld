@@ -1,0 +1,65 @@
+## 表单引擎（`lowcode-dynamicform`）
+
+- **核心问题**：表单引擎怎么设计、用了什么？是不是主要提供「存控件 + 通用数据存储」？
+- **核心答案**：它是一个独立微服务，核心是 **模板（schema JSON）+ 实例数据落库** 的能力。  
+  - **模板侧**：存控件定义、模板 JSON（表单结构树），提供设计期 CRUD 接口。  
+  - **数据侧**：模板绑定 `data_source_id`、`data_table`，实例数据主要落 **MySQL**（主表/子表/插槽子表），并有 **MongoDB** 参与同步/文档场景。  
+  - **缓存侧**：`FormTemplateReload` 以单例 + `ConcurrentHashMap` 缓存模板/属性解析结果。  
+  - **对外接口**：通过 `dynamicform-api` 的 **OpenFeign**（`FormDataApi`）给流程等系统调用（取模板、取表单数据、保存等）。
+  - **主要技术栈**：Spring Boot、MySQL+Druid、tk.mybatis+PageHelper、Redis、MongoDB、Fastjson、Nacos、Feign、Knife4j、Jasypt 等。
+
+## 流程引擎（`flow-engine`）
+
+- **核心问题**：流程引擎是什么？执行模型的逻辑是什么？
+- **核心答案**：这是自研流程运行时，不是 Flowable/Activiti。结构是 **定义期 + 运行期 + 执行器分发**。
+  - **定义期**：`DefinitionProcessor` 负责创建/更新/发布（definition/deployment）。  
+  - **运行期**：`RuntimeProcessor` 负责启动、提交等入口，构建 `RuntimeContext`，交给 `FlowExecutor` 驱动。  
+  - **执行模型**：`FlowExecutor` 里一个 **while 循环推进**：根据 `RuntimeContext.currentNodeModel` 的 `type`，由 `ExecutorFactory` 选择对应节点执行器（start/end/sequence/userTask/approve/exclusive/parallel）。执行后计算下一个节点，继续推进，直到 **挂起或结束**。  
+  - **挂起机制**：审批等需要人处理的节点会“停住”（通过挂起语义/异常），生成待办；人提交后走 `commit`，再继续自动推进。
+
+## 是否使用 Spring 状态机
+
+- **核心问题**：状态是不是用 Spring State Machine？
+- **核心答案**：**没有使用状态机框架**。仓库里无 `spring-statemachine` / `StateMachine` 等依赖或引用。  
+  但**有状态字段**：用整型常量 + 业务代码手写迁态。
+
+## 状态如何流转（大致）
+
+- **核心问题**：没有状态机，那状态怎么流转？
+- **核心答案**：主要靠两层状态：
+  - **流程实例状态** `FlowInstanceStatus`：`RUNNING/COMPLETED/TERMINATED/INVOKED/ABOLISHED` 等，由执行/提交结束时判断是否完成并更新。  
+  - **本次执行结果** `ProcessStatus`：`SUCCESS/FAILED`，用于本次调用落库/失败处理分支。  
+  - 节点层还有 `NodeInstanceStatus`（节点实例的 ACTIVE/COMPLETED/FAILED/DISABLED 等），随执行、回滚、挂起写库。
+
+## 执行器是不是每步都读库？
+
+- **核心问题**：是不是每次读 `workflow_node_instance` 找 nodeKey，再去部署表找类型并执行？
+- **核心答案**：**大方向像，但不是每一步都查库/查部署表**：  
+  - 一次请求里连续自动推进时，当前节点主要在 **内存 `RuntimeContext.currentNodeModel`** 里流转。  
+  - **需要恢复位置**（提交/回滚/重新进入）时，会从 **`workflow_node_instance`** 取挂起节点的 `node_key`，再在已加载的部署模型（`flowElementMap`）里找到节点类型，选执行器继续跑。
+
+## 涉及哪些表（流程侧）
+
+- **核心问题**：执行推进具体涉及哪些表？
+- **核心答案**（最核心几张）：
+  - **`workflow_instance`**：流程实例主表  
+  - **`workflow_node_instance`**：节点实例表（挂起位置、每步记录）  
+  - **`workflow_node_instance_param`**：变量/实例数据表（参数快照）  
+  - **`workflow_node_instance_log`**：节点日志  
+  - **`workflow_approval_task`**（及附件/驳回记录）：审批待办与扩展  
+  - 定义/发布：**`workflow_definition`**、**`workflow_deployment`**
+
+## 自研 vs Flowable/Activiti 的优缺点
+
+- **核心问题**：对比成熟 BPM 引擎有什么优缺点？为什么自研？
+- **核心答案**：
+  - **优点**：更贴业务、更轻、表结构/审批/表单/通知强定制更直接、学习曲线小。  
+  - **缺点**：标准互通与生态弱；复杂 BPMN 特性、审计/迁移/运维工具链要自己补；长期演进依赖核心人员。  
+  - **自研常见原因**：需求相对固定且审批场景强耦合；引入 Flowable/Activiti 的标准能力“过重”，定制与迁移成本不划算。
+
+## BPMN2 是什么、我们算不算 BPMN2？
+
+- **核心问题**：BPMN2 是什么？我们 JSON 流程定义是不是 BPMN2？
+- **核心答案**：
+  - **BPMN 2.0** 是 OMG 的流程建模标准（通常以 **BPMN XML** 交换格式体现），定义图形元素及执行语义。  
+  - 你发的 JSON **在语义上很像 BPMN**（开始/结束、并行网关、顺序流、人工任务等），但**不是 BPMN 2.0 标准 XML 格式**，更准确说是 **“类 BPMN 的自定义模型”**。
